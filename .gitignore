@@ -1,0 +1,5 @@
+.streamlit/secrets.toml
+data/
+vectorstore_chroma/
+__pycache__/
+*.pyc
