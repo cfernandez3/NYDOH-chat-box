@@ -51,7 +51,13 @@ st.markdown(
     div[data-testid="stTextArea"] textarea {border-radius:13px;border:1px solid #c9d7de;font-size:1rem;}
     div.stButton>button {border-radius:11px;font-weight:700;min-height:2.8rem;}
     .small-note {color:#627681;font-size:.85rem;line-height:1.4;}
-    </style>
+    
+    section[data-testid="stSidebar"] div[data-testid="stAlert"] {
+        border-radius: 12px;
+        border: 2px solid #d9534f;
+        background: #fff1f0;
+    }
+</style>
     """,
     unsafe_allow_html=True,
 )
@@ -927,21 +933,14 @@ available_prefixes = sorted(
 )
 
 with st.sidebar:
-    st.markdown("## NYDOH Assistant")
-    st.caption("Clinical Laboratory Standards")
-
-    retrieval_k = 2
-    st.markdown("**Retrieved passages:** 2")
-    st.caption("This setting is fixed to preserve consistent retrieval behavior.")
-
-    st.markdown("---")
-    st.markdown(f"**Documents loaded:** {page_count} pages")
-    st.markdown(f"**Indexed sections:** {chunk_count}")
-    st.markdown("---")
-    st.markdown("### Standards index")
+    # -----------------------------------------------------
+    # 1. STANDARDS INDEX — PRIMARY NAVIGATION
+    # -----------------------------------------------------
+    st.markdown("## 📚 Standards Index")
+    st.caption("Browse or open NYDOH standards by section.")
 
     selected_section = st.selectbox(
-        "Browse a section",
+        "Browse by section",
         ["Select a section"] + available_prefixes,
     )
 
@@ -950,6 +949,7 @@ with st.sidebar:
             1 for item in standard_catalog.values()
             if item["prefix"] == selected_section
         )
+
         st.caption(
             f"{section_count} standards found in {selected_section}."
         )
@@ -1017,36 +1017,98 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.markdown("### Recent questions")
+
+    # -----------------------------------------------------
+    # 2. RECENT QUESTIONS
+    # -----------------------------------------------------
+    st.markdown("### 🕘 Recent Questions")
 
     if not st.session_state.history:
         st.caption("No questions yet.")
     else:
         for index, item in enumerate(reversed(st.session_state.history[-8:])):
             label = item["question"]
+
             if len(label) > 42:
                 label = label[:42] + "…"
-            if st.button(label, key=f"history_{index}", use_container_width=True):
+
+            if st.button(
+                label,
+                key=f"history_{index}",
+                use_container_width=True,
+            ):
                 st.session_state.current_question = item["question"]
                 st.session_state.current_result = item["result"]
                 st.rerun()
 
-    if st.session_state.history and st.button("Clear history", use_container_width=True):
-        st.session_state.history = []
-        st.session_state.current_result = None
-        st.session_state.current_question = ""
-        st.rerun()
+        if st.button(
+            "Clear history",
+            use_container_width=True,
+        ):
+            st.session_state.history = []
+            st.session_state.current_result = None
+            st.session_state.current_question = ""
+            st.rerun()
 
     st.markdown("---")
-    st.markdown(
-        '<div class="small-note">'
-        '<strong>NYDOH answers:</strong> based only on the indexed standards.<br><br>'
-        '<strong>Compliance ideas:</strong> a public web search is used only when the '
-        'question asks how to comply or implement a standard. Do not enter patient-identifiable information.<br><br>'
-        'Verify critical compliance decisions against the official documents.'
-        '</div>',
-        unsafe_allow_html=True,
+
+    # -----------------------------------------------------
+    # 3. PHI WARNING — PROMINENT
+    # -----------------------------------------------------
+    st.error(
+        """
+        **⚠️ IMPORTANT — DO NOT ENTER PHI**
+
+        Never enter Protected Health Information (PHI), patient names,
+        medical record numbers, dates of birth, or any other
+        patient-identifiable information into this application.
+
+        Use this assistant only for regulatory, compliance, policy,
+        procedure, and hypothetical questions.
+        """
     )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # 4. ABOUT
+    # -----------------------------------------------------
+    st.markdown("### ℹ️ About")
+
+    st.markdown(
+        """
+        **NYDOH answers:** based only on the indexed standards.
+
+        **Compliance ideas:** a public web search is used only when the
+        question asks how to comply with or implement a standard.
+
+        **Verification:** critical compliance decisions should always be
+        confirmed against the official NYDOH documents and reviewed by
+        the Laboratory Director.
+        """
+    )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # 5. SYSTEM INFORMATION — BOTTOM / COLLAPSED
+    # -----------------------------------------------------
+    with st.expander("🔧 System Information", expanded=False):
+        st.markdown(
+            f"""
+            **Official Standards Loaded**  
+            {page_count} pages
+
+            **Indexed Knowledge Base**  
+            {chunk_count} searchable sections
+
+            **Evidence Retrieved**  
+            2 passages
+
+            **Retrieval Setting**  
+            Fixed at `k = 2` for consistent behavior
+            """
+        )
 
 st.markdown(
     """
