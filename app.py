@@ -14,6 +14,7 @@ st.set_page_config(
     page_title="NYDOH Standards Assistant",
     page_icon="🧪",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 GENERAL_URL = (
@@ -24,121 +25,97 @@ HISTO_URL = (
     "https://raw.githubusercontent.com/cfernandez3/NYDOH-chat-box/main/"
     "Histocompatibility%20-%20Effective%20February%202026.pdf"
 )
-
 DATA_DIR = Path("data")
-VECTOR_DIR = Path("vectorstore_chroma")
 
+st.markdown(
+    """
+    <style>
+    .stApp {background:#f4f7f9;}
+    .main .block-container {max-width:1180px;padding-top:1.2rem;padding-bottom:2rem;}
+    .hero {background:linear-gradient(135deg,#0f3f56 0%,#1c6b79 100%);color:white;
+           padding:1.6rem 1.9rem;border-radius:18px;margin-bottom:1.25rem;
+           box-shadow:0 8px 24px rgba(15,63,86,.16);}
+    .hero h1 {margin:0 0 .35rem 0;font-size:2rem;line-height:1.15;}
+    .hero p {margin:0;opacity:.92;font-size:1rem;}
+    .answer-card,.panel {background:white;border:1px solid #dce5ea;border-radius:16px;
+                         padding:1.2rem 1.35rem;box-shadow:0 4px 16px rgba(15,63,86,.06);}
+    .answer-card {min-height:220px;}
+    .source-card {background:#f9fbfc;border:1px solid #dce5ea;border-left:5px solid #2c7a62;
+                  border-radius:12px;padding:.85rem .95rem;margin-bottom:.7rem;}
+    .source-title {color:#123f56;font-weight:750;margin-bottom:.35rem;}
+    .source-text {color:#465a67;font-size:.92rem;line-height:1.45;}
+    .eyebrow {font-size:.78rem;text-transform:uppercase;letter-spacing:.09em;
+              color:#5d7380;font-weight:750;margin-bottom:.4rem;}
+    .empty-state {color:#687c88;padding:2.2rem .5rem;text-align:center;}
+    section[data-testid="stSidebar"] {background:#eaf1f4;border-right:1px solid #d4e0e5;}
+    div[data-testid="stTextArea"] textarea {border-radius:13px;border:1px solid #c9d7de;font-size:1rem;}
+    div.stButton>button {border-radius:11px;font-weight:700;min-height:2.8rem;}
+    .small-note {color:#627681;font-size:.85rem;line-height:1.4;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-def get_openai_api_key() -> str:
-    """Read the API key from Streamlit secrets or an environment variable."""
+def get_openai_api_key():
     try:
         key = st.secrets["OPENAI_API_KEY"]
     except (KeyError, FileNotFoundError):
         key = os.getenv("OPENAI_API_KEY")
-
     if not key:
-        st.error(
-            "OPENAI_API_KEY is not configured. Add it to Streamlit Secrets "
-            "or to .streamlit/secrets.toml."
-        )
+        st.error("OPENAI_API_KEY is not configured in Streamlit Secrets.")
         st.stop()
-
     return key
 
-
-def download_pdf(url: str, destination: Path) -> None:
-    """Download a PDF only when it is not already present."""
+def download_pdf(url, destination):
     if destination.exists() and destination.stat().st_size > 0:
         return
-
     destination.parent.mkdir(parents=True, exist_ok=True)
     response = requests.get(url, timeout=60)
     response.raise_for_status()
     destination.write_bytes(response.content)
 
-
-def normalize_standard(value: str) -> str:
-    """Normalize PDF whitespace, e.g. 'HC\\nS5' -> 'HC S5'."""
+def normalize_standard(value):
     return re.sub(r"\s+", " ", value).strip().upper()
 
-
-def extract_standard(text: str) -> str:
-    """Extract codes such as HC S1, QMS S2, or GEN S3.1."""
-    pattern = r"\b[A-Z]{1,10}\s*S\d+(?:\.\d+)?\b"
-    match = re.search(pattern, text, re.IGNORECASE)
+def extract_standard(text):
+    match = re.search(r"\b[A-Z]{1,10}\s*S\d+(?:\.\d+)?\b", text, re.IGNORECASE)
     return normalize_standard(match.group(0)) if match else "Not identified"
 
-
-@st.cache_resource(show_spinner="Loading NYDOH standards and building the search index...")
-def initialize_rag(api_key: str):
-    """
-    Download, load, split, embed, and index the NYDOH standards.
-
-    Streamlit caches the returned resources, so this expensive setup is not
-    repeated on every user interaction.
-    """
+@st.cache_resource(show_spinner="Loading NYDOH standards and preparing the search index...")
+def initialize_rag(api_key):
     general_path = DATA_DIR / "general.pdf"
     histo_path = DATA_DIR / "histocompatibility.pdf"
-
     download_pdf(GENERAL_URL, general_path)
     download_pdf(HISTO_URL, histo_path)
 
-    document_specs = [
+    all_pages = []
+    for pdf_path, source_name in [
         (general_path, "NYDOH General"),
         (histo_path, "NYDOH Histocompatibility"),
-    ]
-
-    all_pages = []
-
-    for pdf_path, source_name in document_specs:
+    ]:
         pages = PyPDFLoader(str(pdf_path)).load()
-
         for page in pages:
             page.metadata["source"] = source_name
-
-            # Save the first standard found on the full page as metadata.
-            standard = extract_standard(page.page_content)
-            page.metadata["standard"] = standard
-
+            page.metadata["standard"] = extract_standard(page.page_content)
         all_pages.extend(pages)
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(all_pages)
-
-    # A chunk may contain a more specific standard than the first one on its page.
     for chunk in chunks:
-        chunk_standard = extract_standard(chunk.page_content)
-        if chunk_standard != "Not identified":
-            chunk.metadata["standard"] = chunk_standard
+        standard = extract_standard(chunk.page_content)
+        if standard != "Not identified":
+            chunk.metadata["standard"] = standard
 
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        api_key=api_key,
-    )
-
-    # Build the vector store in memory. Streamlit caches it across reruns.
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
     vector_db = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
         collection_name="nydoh_standards",
     )
+    return vector_db, OpenAI(api_key=api_key), len(all_pages), len(chunks)
 
-    client = OpenAI(api_key=api_key)
-    return vector_db, client, len(all_pages), len(chunks)
-
-
-def answer_question(
-    query: str,
-    vector_db: Chroma,
-    client: OpenAI,
-    k: int = 2,
-) -> dict:
-    """Retrieve relevant standards and generate a grounded answer."""
+def answer_question(query, vector_db, client, k=2):
     docs = vector_db.similarity_search(query, k=k)
-
     if not docs:
         return {
             "answer": "I do not see a clear answer in the provided NYDOH materials.",
@@ -146,7 +123,6 @@ def answer_question(
         }
 
     context = "\n\n".join(doc.page_content for doc in docs)
-
     prompt = f"""
 CONTEXT:
 {context}
@@ -155,12 +131,13 @@ INSTRUCTIONS:
 - You are a compliance assistant for NYDOH Clinical Laboratory Standards of Practice.
 - Help laboratory professionals understand regulatory requirements.
 - Answer clearly and professionally.
+- Use concise headings or bullets when helpful.
 
 RULES:
 - Use ONLY the provided context.
 - Do NOT hallucinate or invent information.
 - Do NOT use prior knowledge.
-- Do NOT reference external laws, websites, or sources not in the context.
+- Do NOT reference external sources not in the context.
 - If the answer is not in the context, say:
   "I do not see a clear answer in the provided NYDOH materials."
 - When possible, identify the relevant standard.
@@ -170,7 +147,6 @@ QUESTION:
 
 ANSWER:
 """
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -178,17 +154,11 @@ ANSWER:
         max_tokens=700,
     )
 
-    answer = response.choices[0].message.content.strip()
-
-    sources = []
-    seen = set()
-
+    sources, seen = [], set()
     for doc in docs:
         metadata = doc.metadata
         standard = metadata.get("standard") or extract_standard(doc.page_content)
         page = metadata.get("page_label")
-
-        # PyPDFLoader page is zero-based. Use it only if page_label is absent.
         if page is None:
             raw_page = metadata.get("page")
             page = str(raw_page + 1) if isinstance(raw_page, int) else "Unknown"
@@ -197,100 +167,145 @@ ANSWER:
             "standard": standard,
             "source": metadata.get("source", "Unknown"),
             "page": str(page),
-            "context": doc.page_content,
+            "context": re.sub(r"\s+", " ", doc.page_content).strip(),
         }
-
         key = (item["standard"], item["source"], item["page"])
         if key not in seen:
             seen.add(key)
             sources.append(item)
 
-    return {"answer": answer, "sources": sources}
+    return {"answer": response.choices[0].message.content.strip(), "sources": sources}
 
+if "current_result" not in st.session_state:
+    st.session_state.current_result = None
+if "current_question" not in st.session_state:
+    st.session_state.current_question = ""
+if "history" not in st.session_state:
+    st.session_state.history = []
 
 api_key = get_openai_api_key()
 vector_db, client, page_count, chunk_count = initialize_rag(api_key)
 
-st.title("NYDOH Clinical Laboratory Standards Assistant")
-st.caption(
-    "Ask questions about the General Systems and Histocompatibility standards. "
-    "Answers are generated only from the indexed NYDOH documents."
-)
-
 with st.sidebar:
-    st.header("About")
-    st.write(f"Loaded pages: **{page_count}**")
-    st.write(f"Indexed chunks: **{chunk_count}**")
+    st.markdown("## NYDOH Assistant")
+    st.caption("Clinical Laboratory Standards")
+
     retrieval_k = st.select_slider(
-        "Number of retrieved passages",
+        "Retrieved passages",
         options=[1, 2, 3, 4],
         value=2,
-        help="Two is a practical starting point. More passages may improve recall but reduce precision.",
-    )
-    st.warning(
-        "This tool supports review of the supplied standards. "
-        "Always verify critical compliance decisions against the official document."
+        help="More passages may improve recall but can reduce precision.",
     )
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.markdown("---")
+    st.markdown(f"**Documents loaded:** {page_count} pages")
+    st.markdown(f"**Indexed sections:** {chunk_count}")
+    st.markdown("---")
+    st.markdown("### Recent questions")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    if not st.session_state.history:
+        st.caption("No questions yet.")
+    else:
+        for index, item in enumerate(reversed(st.session_state.history[-8:])):
+            label = item["question"]
+            if len(label) > 42:
+                label = label[:42] + "…"
+            if st.button(label, key=f"history_{index}", use_container_width=True):
+                st.session_state.current_question = item["question"]
+                st.session_state.current_result = item["result"]
+                st.rerun()
 
-        if message["role"] == "assistant" and message.get("sources"):
-            with st.expander("Sources"):
-                for source in message["sources"]:
-                    label = (
-                        f"{source['standard']} | "
-                        f"{source['source']} | Page {source['page']}"
-                    )
-                    st.markdown(f"**{label}**")
-                    st.caption(source["context"][:700] + ("…" if len(source["context"]) > 700 else ""))
+    if st.session_state.history and st.button("Clear history", use_container_width=True):
+        st.session_state.history = []
+        st.session_state.current_result = None
+        st.session_state.current_question = ""
+        st.rerun()
 
-question = st.chat_input("Ask a question about the NYDOH standards")
+    st.markdown("---")
+    st.markdown(
+        '<div class="small-note">Verify critical compliance decisions against the official documents.</div>',
+        unsafe_allow_html=True,
+    )
 
-if question:
-    st.session_state.messages.append({"role": "user", "content": question})
+st.markdown(
+    """
+    <div class="hero">
+        <h1>🧪 NYDOH Clinical Laboratory Standards Assistant</h1>
+        <p>Ask questions about the General Systems and Histocompatibility standards.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-    with st.chat_message("user"):
-        st.markdown(question)
+st.markdown('<div class="eyebrow">Ask a question</div>', unsafe_allow_html=True)
+question = st.text_area(
+    "Question",
+    value=st.session_state.current_question,
+    placeholder="Example: What does NYDOH require for crossmatching in histocompatibility?",
+    height=105,
+    label_visibility="collapsed",
+)
 
-    with st.chat_message("assistant"):
+c1, c2, _ = st.columns([1, 1, 5])
+with c1:
+    ask_clicked = st.button("Ask", type="primary", use_container_width=True)
+with c2:
+    new_clicked = st.button("New question", use_container_width=True)
+
+if new_clicked:
+    st.session_state.current_question = ""
+    st.session_state.current_result = None
+    st.rerun()
+
+if ask_clicked:
+    cleaned = question.strip()
+    if not cleaned:
+        st.warning("Please enter a question.")
+    else:
         with st.spinner("Reviewing the NYDOH standards..."):
-            try:
-                result = answer_question(
-                    query=question,
-                    vector_db=vector_db,
-                    client=client,
-                    k=retrieval_k,
+            result = answer_question(cleaned, vector_db, client, retrieval_k)
+        st.session_state.current_question = cleaned
+        st.session_state.current_result = result
+        st.session_state.history.append({"question": cleaned, "result": result})
+        st.rerun()
+
+st.markdown("---")
+left, right = st.columns([1.7, 1])
+
+with left:
+    st.markdown('<div class="eyebrow">Current answer</div>', unsafe_allow_html=True)
+    if st.session_state.current_result is None:
+        st.markdown(
+            '<div class="answer-card"><div class="empty-state">Enter a question above to begin.</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown('<div class="answer-card">', unsafe_allow_html=True)
+        st.markdown(st.session_state.current_result["answer"])
+        st.markdown("</div>", unsafe_allow_html=True)
+
+with right:
+    st.markdown('<div class="eyebrow">Supporting standards</div>', unsafe_allow_html=True)
+    if st.session_state.current_result is None:
+        st.markdown(
+            '<div class="panel"><div class="empty-state">Sources will appear here.</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        sources = st.session_state.current_result["sources"]
+        if not sources:
+            st.info("No supporting passages were retrieved.")
+        else:
+            for source in sources:
+                excerpt = source["context"][:520]
+                if len(source["context"]) > 520:
+                    excerpt += "…"
+                st.markdown(
+                    f"""
+                    <div class="source-card">
+                        <div class="source-title">{source['standard']} | Page {source['page']}</div>
+                        <div class="source-text">{excerpt}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-            except Exception as exc:
-                st.error(f"The question could not be processed: {exc}")
-                st.stop()
-
-        st.markdown(result["answer"])
-
-        with st.expander("Sources", expanded=True):
-            if not result["sources"]:
-                st.write("No supporting passages were retrieved.")
-            else:
-                for source in result["sources"]:
-                    label = (
-                        f"{source['standard']} | "
-                        f"{source['source']} | Page {source['page']}"
-                    )
-                    st.markdown(f"**{label}**")
-                    st.caption(
-                        source["context"][:700]
-                        + ("…" if len(source["context"]) > 700 else "")
-                    )
-
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": result["answer"],
-            "sources": result["sources"],
-        }
-    )
