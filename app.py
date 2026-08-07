@@ -187,8 +187,100 @@ Return:
     return response.output_text.strip()
 
 
+def expand_query_for_retrieval(query):
+    """
+    Add standards-oriented concepts to the retrieval query without changing
+    the user's displayed question.
+
+    This helps connect common healthcare terminology (for example HIPAA or PHI)
+    to wording more likely to appear in the NYDOH standards, such as
+    confidentiality, privacy, authorized access, disclosure, and patient data.
+    """
+    normalized = re.sub(r"\s+", " ", query.lower()).strip()
+    expansions = []
+
+    concept_map = {
+        "hipaa": (
+            "patient information confidentiality privacy protected health information "
+            "authorized access unauthorized access disclosure release of information "
+            "security of patient data personnel confidentiality training"
+        ),
+        "phi": (
+            "protected health information patient information confidentiality privacy "
+            "authorized access disclosure release of information"
+        ),
+        "patient data": (
+            "patient information confidentiality privacy authorized access disclosure "
+            "security records"
+        ),
+        "patient information": (
+            "confidentiality privacy authorized access disclosure release of information "
+            "security records"
+        ),
+        "confidentiality": (
+            "patient information privacy authorized access unauthorized disclosure "
+            "release of information personnel training"
+        ),
+        "privacy": (
+            "patient information confidentiality authorized access disclosure "
+            "release of information"
+        ),
+        "medical records": (
+            "patient records confidentiality privacy access disclosure retention security"
+        ),
+        "cybersecurity": (
+            "information security access control confidentiality integrity availability "
+            "electronic records"
+        ),
+        "data security": (
+            "information security access control confidentiality integrity availability "
+            "electronic records"
+        ),
+        "access control": (
+            "authorized access unique user identification permissions patient information "
+            "confidentiality"
+        ),
+    }
+
+    for phrase, expansion in concept_map.items():
+        if phrase in normalized:
+            expansions.append(expansion)
+
+    if not expansions:
+        return query
+
+    return f"{query}\nRelated NYDOH concepts: {' '.join(expansions)}"
+
+
+def get_concept_note(query):
+    """
+    Provide a short, careful bridge when the user uses a common external term
+    that may not appear verbatim in the NYDOH standards.
+    """
+    normalized = query.lower()
+
+    if "hipaa" in normalized:
+        return (
+            "The indexed NYDOH standards may not use the word **HIPAA** in the "
+            "retrieved passage. The answer below connects the question to the "
+            "NYDOH requirements concerning patient-information confidentiality, "
+            "privacy, authorized access, and disclosure. HIPAA applicability itself "
+            "should be verified separately by the laboratory's compliance leadership."
+        )
+
+    if "phi" in normalized or "protected health information" in normalized:
+        return (
+            "The NYDOH standards may describe this concept as patient-information "
+            "confidentiality, privacy, access, or disclosure rather than using the "
+            "term **PHI**."
+        )
+
+    return None
+
+
 def answer_question(query, vector_db, client, k=2):
-    docs = vector_db.similarity_search(query, k=k)
+    retrieval_query = expand_query_for_retrieval(query)
+    docs = vector_db.similarity_search(retrieval_query, k=k)
     if not docs:
         return {
             "answer": "I do not see a clear answer in the provided NYDOH materials.",
@@ -214,6 +306,12 @@ RULES:
 - If the answer is not in the context, say:
   "I do not see a clear answer in the provided NYDOH materials."
 - When possible, identify the relevant standard.
+- If the user uses a common external term such as HIPAA or PHI and that exact
+  term is not present in the context, do not claim that NYDOH defines it.
+  Instead, explain which NYDOH concepts in the retrieved context are related,
+  such as confidentiality, privacy, authorized access, disclosure, security,
+  or personnel training.
+- Clearly distinguish an NYDOH requirement from a broader healthcare concept.
 
 QUESTION:
 {query}
@@ -248,6 +346,7 @@ ANSWER:
             sources.append(item)
 
     grounded_answer = response.choices[0].message.content.strip()
+    concept_note = get_concept_note(query)
     web_ideas = None
 
     if asks_for_compliance_ideas(query):
@@ -265,6 +364,7 @@ ANSWER:
 
     return {
         "answer": grounded_answer,
+        "concept_note": concept_note,
         "sources": sources,
         "web_ideas": web_ideas,
     }
@@ -370,20 +470,23 @@ left, right = st.columns([1.7, 1])
 with left:
     st.markdown('<div class="eyebrow">Current answer</div>', unsafe_allow_html=True)
     if st.session_state.current_result is None:
-        st.markdown(
-            '<div class="answer-card"><div class="empty-state">Enter a question above to begin.</div></div>',
-            unsafe_allow_html=True,
-        )
+        with st.container(border=True):
+            st.markdown(
+                '<div class="empty-state">Enter a question above to begin.</div>',
+                unsafe_allow_html=True,
+            )
     else:
-        st.markdown('<div class="answer-card">', unsafe_allow_html=True)
-        st.markdown(st.session_state.current_result["answer"])
+        with st.container(border=True):
+            concept_note = st.session_state.current_result.get("concept_note")
+            if concept_note:
+                st.info(concept_note)
 
-        web_ideas = st.session_state.current_result.get("web_ideas")
-        if web_ideas:
-            st.markdown("---")
-            st.markdown(web_ideas)
+            st.markdown(st.session_state.current_result["answer"])
 
-        st.markdown("</div>", unsafe_allow_html=True)
+            web_ideas = st.session_state.current_result.get("web_ideas")
+            if web_ideas:
+                st.markdown("---")
+                st.markdown(web_ideas)
 
 with right:
     st.markdown('<div class="eyebrow">Supporting standards</div>', unsafe_allow_html=True)
