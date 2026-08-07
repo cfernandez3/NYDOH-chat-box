@@ -278,6 +278,202 @@ CONNECTIONS:
     return response.choices[0].message.content.strip()
 
 
+
+def standard_sort_key(code):
+    match = re.match(
+        r"^([A-Z]{1,10})\s+S(\d+)(?:\.(\d+))?$",
+        normalize_standard(code),
+    )
+    if not match:
+        return (normalize_standard(code), 9999, 9999)
+
+    prefix, major, minor = match.groups()
+    return (prefix, int(major), int(minor or 0))
+
+
+def build_standard_catalog(chunks):
+    """
+    Build a unique catalog of all identifiable standards in the indexed PDFs.
+    """
+    catalog = {}
+    pattern = re.compile(
+        r"\b([A-Z]{1,10})\s*S(\d+(?:\.\d+)?)\b",
+        re.IGNORECASE,
+    )
+
+    for chunk in chunks:
+        compact = re.sub(r"\s+", " ", chunk.page_content).strip()
+
+        for match in pattern.finditer(compact):
+            code = normalize_standard(
+                f"{match.group(1)} S{match.group(2)}"
+            )
+
+            metadata = chunk.metadata
+            source_name = metadata.get("source", "Unknown")
+
+            page = metadata.get("page_label")
+            if page is None:
+                raw_page = metadata.get("page")
+                page = str(raw_page + 1) if isinstance(raw_page, int) else "Unknown"
+
+            pdf_url = GENERAL_URL if source_name == "NYDOH General" else HISTO_URL
+            title = extract_standard_title(compact, code)
+
+            excerpt_start = max(0, match.start() - 40)
+            excerpt_end = min(len(compact), match.end() + 520)
+            excerpt = compact[excerpt_start:excerpt_end].strip()
+
+            candidate = {
+                "standard": code,
+                "prefix": code.split()[0],
+                "title": title,
+                "source": source_name,
+                "page": str(page),
+                "pdf_link": f"{pdf_url}#page={page}",
+                "excerpt": excerpt,
+            }
+
+            existing = catalog.get(code)
+            if existing is None:
+                catalog[code] = candidate
+            elif (
+                existing["title"] == "Title not identified"
+                and title != "Title not identified"
+            ):
+                catalog[code] = candidate
+
+    return dict(
+        sorted(
+            catalog.items(),
+            key=lambda item: standard_sort_key(item[0]),
+        )
+    )
+
+
+def summarize_catalog_entry(entry):
+    text = entry["excerpt"]
+    text = re.sub(
+        rf"(?i).*?{re.escape(entry['standard'])}\s*[:\-]?\s*",
+        "",
+        text,
+        count=1,
+    ).strip()
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    summary = " ".join(sentences[:2]).strip()
+
+    if len(summary) > 320:
+        summary = summary[:320].rstrip() + "…"
+
+    return summary or "Summary not available from the indexed excerpt."
+
+
+def detect_index_request(query, prefixes):
+    normalized = re.sub(r"\s+", " ", query.lower()).strip()
+
+    full_index_phrases = [
+        "show the index",
+        "show me the index",
+        "standards index",
+        "list all standards",
+        "show all standards",
+        "table of contents",
+        "list the sections",
+        "show the sections",
+    ]
+
+    for prefix in prefixes:
+        prefix_lower = prefix.lower()
+
+        if re.search(rf"\b{re.escape(prefix_lower)}\b", normalized):
+            intent_words = [
+                "all",
+                "section",
+                "standards",
+                "list",
+                "index",
+                "show",
+                "summary",
+                "summarize",
+            ]
+
+            if any(word in normalized for word in intent_words):
+                return {"type": "section", "prefix": prefix}
+
+    if any(phrase in normalized for phrase in full_index_phrases):
+        return {"type": "full", "prefix": None}
+
+    return None
+
+
+def format_standard_index(catalog, prefix=None):
+    entries = list(catalog.values())
+
+    if prefix:
+        entries = [
+            item for item in entries
+            if item["prefix"] == prefix
+        ]
+
+    if not entries:
+        return (
+            f"No indexed standards were found for section **{prefix}**."
+            if prefix
+            else "No indexed standards were found."
+        )
+
+    if prefix:
+        lines = [
+            f"## {prefix} Standards",
+            "",
+            f"**{len(entries)} standards found.**",
+            "",
+        ]
+    else:
+        prefixes = sorted(
+            {item["prefix"] for item in entries}
+        )
+        lines = [
+            "## NYDOH Standards Index",
+            "",
+            (
+                f"**{len(entries)} standards found across "
+                f"{len(prefixes)} sections.**"
+            ),
+            "",
+        ]
+
+    grouped = {}
+    for item in entries:
+        grouped.setdefault(item["prefix"], []).append(item)
+
+    for section in sorted(grouped):
+        if not prefix:
+            lines.extend([f"### {section}", ""])
+
+        for item in sorted(
+            grouped[section],
+            key=lambda row: standard_sort_key(row["standard"]),
+        ):
+            summary = summarize_catalog_entry(item)
+
+            lines.extend(
+                [
+                    (
+                        f"**[{item['standard']} — {item['title']}]"
+                        f"({item['pdf_link']})**"
+                    ),
+                    f"Page {item['page']} · {item['source']}",
+                    "",
+                    summary,
+                    "",
+                ]
+            )
+
+    return "\n".join(lines)
+
+
 @st.cache_resource(show_spinner="Loading NYDOH standards and preparing the search index...")
 def initialize_rag(api_key):
     general_path = DATA_DIR / "general.pdf"
@@ -309,7 +505,16 @@ def initialize_rag(api_key):
         embedding=embeddings,
         collection_name="nydoh_standards",
     )
-    return vector_db, OpenAI(api_key=api_key), len(all_pages), len(chunks), chunks
+    standard_catalog = build_standard_catalog(chunks)
+
+    return (
+        vector_db,
+        OpenAI(api_key=api_key),
+        len(all_pages),
+        len(chunks),
+        chunks,
+        standard_catalog,
+    )
 
 def asks_for_compliance_ideas(query):
     """
@@ -475,12 +680,33 @@ def get_concept_note(query):
     return None
 
 
-def answer_question(query, vector_db, client, chunks, k=2):
+def answer_question(query, vector_db, client, chunks, catalog, k=2):
     """
     Answer retrieval remains fixed at k=2.
 
     A wider candidate search is used only for related-standard discovery.
     """
+    index_request = detect_index_request(
+        query,
+        sorted({item["prefix"] for item in catalog.values()}),
+    )
+
+    if index_request:
+        return {
+            "answer": format_standard_index(
+                catalog,
+                prefix=index_request["prefix"],
+            ),
+            "concept_note": None,
+            "sources": [],
+            "related_standards": [],
+            "connections": None,
+            "checklist": None,
+            "web_ideas": None,
+            "index_mode": True,
+            "index_prefix": index_request["prefix"],
+        }
+
     requested_standard = standard_search_query(query)
 
     if requested_standard:
@@ -514,6 +740,8 @@ def answer_question(query, vector_db, client, chunks, k=2):
             "connections": None,
             "checklist": None,
             "web_ideas": None,
+            "index_mode": False,
+            "index_prefix": None,
         }
 
     context = "\n\n".join(doc.page_content for doc in docs)
@@ -673,6 +901,8 @@ ANSWER:
         "connections": connections,
         "checklist": checklist,
         "web_ideas": web_ideas,
+        "index_mode": False,
+        "index_prefix": None,
     }
 
 if "current_result" not in st.session_state:
@@ -683,7 +913,18 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 api_key = get_openai_api_key()
-vector_db, client, page_count, chunk_count, all_chunks = initialize_rag(api_key)
+(
+    vector_db,
+    client,
+    page_count,
+    chunk_count,
+    all_chunks,
+    standard_catalog,
+) = initialize_rag(api_key)
+
+available_prefixes = sorted(
+    {item["prefix"] for item in standard_catalog.values()}
+)
 
 with st.sidebar:
     st.markdown("## NYDOH Assistant")
@@ -696,6 +937,85 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(f"**Documents loaded:** {page_count} pages")
     st.markdown(f"**Indexed sections:** {chunk_count}")
+    st.markdown("---")
+    st.markdown("### Standards index")
+
+    selected_section = st.selectbox(
+        "Browse a section",
+        ["Select a section"] + available_prefixes,
+    )
+
+    if selected_section != "Select a section":
+        section_count = sum(
+            1 for item in standard_catalog.values()
+            if item["prefix"] == selected_section
+        )
+        st.caption(
+            f"{section_count} standards found in {selected_section}."
+        )
+
+        if st.button(
+            f"View all {selected_section} standards",
+            use_container_width=True,
+        ):
+            index_result = {
+                "answer": format_standard_index(
+                    standard_catalog,
+                    prefix=selected_section,
+                ),
+                "concept_note": None,
+                "sources": [],
+                "related_standards": [],
+                "connections": None,
+                "checklist": None,
+                "web_ideas": None,
+                "index_mode": True,
+                "index_prefix": selected_section,
+            }
+
+            synthetic_question = (
+                f"Show all {selected_section} standards"
+            )
+
+            st.session_state.current_question = synthetic_question
+            st.session_state.current_result = index_result
+            st.session_state.history.append(
+                {
+                    "question": synthetic_question,
+                    "result": index_result,
+                }
+            )
+            st.rerun()
+
+    if st.button(
+        "View full standards index",
+        use_container_width=True,
+    ):
+        index_result = {
+            "answer": format_standard_index(
+                standard_catalog,
+                prefix=None,
+            ),
+            "concept_note": None,
+            "sources": [],
+            "related_standards": [],
+            "connections": None,
+            "checklist": None,
+            "web_ideas": None,
+            "index_mode": True,
+            "index_prefix": None,
+        }
+
+        st.session_state.current_question = "Show the standards index"
+        st.session_state.current_result = index_result
+        st.session_state.history.append(
+            {
+                "question": "Show the standards index",
+                "result": index_result,
+            }
+        )
+        st.rerun()
+
     st.markdown("---")
     st.markdown("### Recent questions")
 
@@ -764,7 +1084,14 @@ if ask_clicked:
         st.warning("Please enter a question.")
     else:
         with st.spinner("Reviewing the NYDOH standards..."):
-            result = answer_question(cleaned, vector_db, client, all_chunks, 2)
+            result = answer_question(
+                cleaned,
+                vector_db,
+                client,
+                all_chunks,
+                standard_catalog,
+                2,
+            )
         st.session_state.current_question = cleaned
         st.session_state.current_result = result
         st.session_state.history.append({"question": cleaned, "result": result})
@@ -785,42 +1112,46 @@ with left:
     else:
         result = st.session_state.current_result
 
-        answer_tab, checklist_tab, connections_tab = st.tabs(
-            ["Answer", "Compliance checklist", "Connected standards"]
-        )
-
-        with answer_tab:
+        if result.get("index_mode"):
             with st.container(border=True):
-                concept_note = result.get("concept_note")
-                if concept_note:
-                    st.info(concept_note)
-
                 st.markdown(result["answer"])
+        else:
+            answer_tab, checklist_tab, connections_tab = st.tabs(
+                ["Answer", "Compliance checklist", "Connected standards"]
+            )
 
-                web_ideas = result.get("web_ideas")
-                if web_ideas:
-                    st.markdown("---")
-                    st.markdown(web_ideas)
+            with answer_tab:
+                with st.container(border=True):
+                    concept_note = result.get("concept_note")
+                    if concept_note:
+                        st.info(concept_note)
 
-        with checklist_tab:
-            with st.container(border=True):
-                checklist = result.get("checklist")
-                if checklist:
-                    st.markdown(checklist)
-                    st.caption(
-                        "This checklist is derived only from the retrieved NYDOH text "
-                        "and should be reviewed against the full standard."
-                    )
-                else:
-                    st.info("A checklist could not be generated from the retrieved text.")
+                    st.markdown(result["answer"])
 
-        with connections_tab:
-            with st.container(border=True):
-                connections = result.get("connections")
-                if connections:
-                    st.markdown(connections)
-                else:
-                    st.info("No additional standard connections were identified.")
+                    web_ideas = result.get("web_ideas")
+                    if web_ideas:
+                        st.markdown("---")
+                        st.markdown(web_ideas)
+
+            with checklist_tab:
+                with st.container(border=True):
+                    checklist = result.get("checklist")
+                    if checklist:
+                        st.markdown(checklist)
+                        st.caption(
+                            "This checklist is derived only from the retrieved NYDOH text "
+                            "and should be reviewed against the full standard."
+                        )
+                    else:
+                        st.info("A checklist could not be generated from the retrieved text.")
+
+            with connections_tab:
+                with st.container(border=True):
+                    connections = result.get("connections")
+                    if connections:
+                        st.markdown(connections)
+                    else:
+                        st.info("No additional standard connections were identified.")
 
 with right:
     st.markdown('<div class="eyebrow">Supporting standards</div>', unsafe_allow_html=True)
@@ -830,32 +1161,55 @@ with right:
             unsafe_allow_html=True,
         )
     else:
-        sources = st.session_state.current_result["sources"]
-        if not sources:
-            st.info("No supporting passages were retrieved.")
-        else:
-            for source in sources:
-                st.markdown(
-                    f"""
-                    <div class="source-card">
-                        <div class="source-title">
-                            {source['standard']} — {source['title']}
-                        </div>
-                        <div><strong>Page {source['page']}</strong> ·
-                        <a href="{source['pdf_link']}" target="_blank">Open PDF</a></div>
-                        <div class="source-text" style="margin-top:.55rem;">
-                            {source['highlighted_paragraph']}
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+        current_result = st.session_state.current_result
+
+        if current_result.get("index_mode"):
+            selected_prefix = current_result.get("index_prefix")
+
+            if selected_prefix:
+                count = sum(
+                    1 for item in standard_catalog.values()
+                    if item["prefix"] == selected_prefix
+                )
+                st.success(
+                    f"{count} standards listed in {selected_prefix}."
+                )
+            else:
+                st.success(
+                    f"{len(standard_catalog)} standards listed across "
+                    f"{len(available_prefixes)} sections."
                 )
 
-            related = st.session_state.current_result.get("related_standards", [])
-            if related:
-                st.markdown("#### Related standards")
-                for item in related:
+            st.markdown("**Available sections**")
+            st.write(", ".join(available_prefixes))
+        else:
+            sources = current_result["sources"]
+
+            if not sources:
+                st.info("No supporting passages were retrieved.")
+            else:
+                for source in sources:
                     st.markdown(
-                        f"- **[{item['standard']} — {item['title']}]"
-                        f"({item['pdf_link']})**, page {item['page']}"
+                        f"""
+                        <div class="source-card">
+                            <div class="source-title">
+                                {source['standard']} — {source['title']}
+                            </div>
+                            <div><strong>Page {source['page']}</strong> ·
+                            <a href="{source['pdf_link']}" target="_blank">Open PDF</a></div>
+                            <div class="source-text" style="margin-top:.55rem;">
+                                {source['highlighted_paragraph']}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
                     )
+
+                related = current_result.get("related_standards", [])
+                if related:
+                    st.markdown("#### Related standards")
+                    for item in related:
+                        st.markdown(
+                            f"- **[{item['standard']} — {item['title']}]"
+                            f"({item['pdf_link']})**, page {item['page']}"
+                        )
