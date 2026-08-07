@@ -81,6 +81,203 @@ def extract_standard(text):
     match = re.search(r"\b[A-Z]{1,10}\s*S\d+(?:\.\d+)?\b", text, re.IGNORECASE)
     return normalize_standard(match.group(0)) if match else "Not identified"
 
+
+def extract_standard_title(text, standard_code):
+    """
+    Extract a short title appearing near the standard code.
+    Example: HC S5 -> Crossmatching
+    """
+    if not standard_code or standard_code == "Not identified":
+        return "Title not identified"
+
+    compact = re.sub(r"\s+", " ", text).strip()
+
+    patterns = [
+        rf"{re.escape(standard_code)}\s*[:\-]\s*([^.;]{{3,120}})",
+        rf"{re.escape(standard_code)}\)?\s*([^.;]{{3,120}})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, compact, re.IGNORECASE)
+        if match:
+            title = match.group(1).strip(" :-")
+            if len(title) > 90:
+                title = title[:90].rstrip() + "…"
+            return title
+
+    return "Title not identified"
+
+
+def split_paragraphs(text):
+    paragraphs = [
+        re.sub(r"\s+", " ", item).strip()
+        for item in re.split(r"\n\s*\n", text)
+        if item.strip()
+    ]
+
+    if len(paragraphs) <= 1:
+        paragraphs = [
+            re.sub(r"\s+", " ", item).strip()
+            for item in re.split(r"(?<=[.;:])\s+(?=[A-Z0-9])", text)
+            if item.strip()
+        ]
+
+    return paragraphs
+
+
+def best_supporting_paragraph(query, text):
+    """
+    Select the most query-relevant paragraph from a retrieved chunk.
+    This is deterministic and does not generate new wording.
+    """
+    paragraphs = split_paragraphs(text)
+    if not paragraphs:
+        return re.sub(r"\s+", " ", text).strip()
+
+    stopwords = {
+        "what", "when", "where", "which", "with", "that", "this", "from",
+        "have", "does", "must", "shall", "about", "into", "your", "their",
+        "how", "are", "the", "and", "for", "can", "should", "would",
+    }
+
+    query_terms = {
+        token
+        for token in re.findall(r"[a-zA-Z0-9]+", query.lower())
+        if len(token) > 2 and token not in stopwords
+    }
+
+    def score(paragraph):
+        lower = paragraph.lower()
+        overlap = sum(1 for term in query_terms if term in lower)
+        standard_bonus = 2 if re.search(r"\b[A-Z]{1,10}\s*S\d+", paragraph) else 0
+        return overlap + standard_bonus
+
+    return max(paragraphs, key=score)
+
+
+def highlight_query_terms(text, query):
+    terms = sorted(
+        {
+            token for token in re.findall(r"[a-zA-Z0-9]+", query)
+            if len(token) > 3
+        },
+        key=len,
+        reverse=True,
+    )
+
+    highlighted = text
+    for term in terms[:10]:
+        highlighted = re.sub(
+            rf"(?i)\b({re.escape(term)})\b",
+            r"<mark>\1</mark>",
+            highlighted,
+        )
+
+    return highlighted
+
+
+def standard_search_query(query):
+    """
+    Detect direct searches such as 'HC S5' or 'show me QMS S2'.
+    """
+    match = re.search(r"\b[A-Z]{1,10}\s*S\d+(?:\.\d+)?\b", query, re.IGNORECASE)
+    return normalize_standard(match.group(0)) if match else None
+
+
+def find_chunks_by_standard(chunks, standard_code):
+    exact = []
+
+    for chunk in chunks:
+        metadata_code = normalize_standard(
+            str(chunk.metadata.get("standard", ""))
+        )
+
+        content_code = extract_standard(chunk.page_content)
+
+        if standard_code in {metadata_code, content_code}:
+            exact.append(chunk)
+
+    return exact
+
+
+def build_compliance_checklist(question, answer, source_text, client):
+    """
+    Create a checklist using only the grounded answer and NYDOH source text.
+    """
+    prompt = f"""
+Create a concise compliance checklist using ONLY the NYDOH material below.
+
+QUESTION:
+{question}
+
+GROUNDED ANSWER:
+{answer}
+
+NYDOH SOURCE TEXT:
+{source_text}
+
+RULES:
+- Return 4 to 8 checklist items.
+- Start every item with "- [ ]".
+- Do not invent requirements.
+- If the source does not support a checklist item, omit it.
+- Use operational wording such as "Maintain", "Document", "Review", or "Verify".
+- Do not add internet-derived implementation ideas.
+
+CHECKLIST:
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=450,
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+def explain_standard_connections(question, related_sources, client):
+    """
+    Explain how multiple retrieved standards relate, using only their text.
+    """
+    if len(related_sources) < 2:
+        return None
+
+    context = "\n\n".join(
+        f"{item['standard']} — {item['title']}:\n{item['context']}"
+        for item in related_sources[:4]
+    )
+
+    prompt = f"""
+Using ONLY the NYDOH excerpts below, explain briefly how the standards connect
+to the user's question.
+
+USER QUESTION:
+{question}
+
+NYDOH EXCERPTS:
+{context}
+
+RULES:
+- Use 2 to 4 bullets.
+- Name each standard explicitly.
+- Do not invent relationships not supported by the excerpts.
+- Distinguish primary requirements from supporting or related requirements.
+
+CONNECTIONS:
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=400,
+    )
+
+    return response.choices[0].message.content.strip()
+
+
 @st.cache_resource(show_spinner="Loading NYDOH standards and preparing the search index...")
 def initialize_rag(api_key):
     general_path = DATA_DIR / "general.pdf"
@@ -112,7 +309,7 @@ def initialize_rag(api_key):
         embedding=embeddings,
         collection_name="nydoh_standards",
     )
-    return vector_db, OpenAI(api_key=api_key), len(all_pages), len(chunks)
+    return vector_db, OpenAI(api_key=api_key), len(all_pages), len(chunks), chunks
 
 def asks_for_compliance_ideas(query):
     """
@@ -278,16 +475,49 @@ def get_concept_note(query):
     return None
 
 
-def answer_question(query, vector_db, client, k=2):
-    retrieval_query = expand_query_for_retrieval(query)
-    docs = vector_db.similarity_search(retrieval_query, k=k)
+def answer_question(query, vector_db, client, chunks, k=2):
+    """
+    Answer retrieval remains fixed at k=2.
+
+    A wider candidate search is used only for related-standard discovery.
+    """
+    requested_standard = standard_search_query(query)
+
+    if requested_standard:
+        exact_docs = find_chunks_by_standard(chunks, requested_standard)
+        docs = exact_docs[:k]
+
+        if len(docs) < k:
+            fallback = vector_db.similarity_search(query, k=k)
+            existing_ids = {
+                (doc.metadata.get("source"), doc.metadata.get("page"))
+                for doc in docs
+            }
+
+            for doc in fallback:
+                key = (doc.metadata.get("source"), doc.metadata.get("page"))
+                if key not in existing_ids:
+                    docs.append(doc)
+                    existing_ids.add(key)
+                if len(docs) >= k:
+                    break
+    else:
+        retrieval_query = expand_query_for_retrieval(query)
+        docs = vector_db.similarity_search(retrieval_query, k=k)
+
     if not docs:
         return {
             "answer": "I do not see a clear answer in the provided NYDOH materials.",
+            "concept_note": get_concept_note(query),
             "sources": [],
+            "related_standards": [],
+            "connections": None,
+            "checklist": None,
+            "web_ideas": None,
         }
 
     context = "\n\n".join(doc.page_content for doc in docs)
+
     prompt = f"""
 CONTEXT:
 {context}
@@ -305,12 +535,10 @@ RULES:
 - Do NOT reference external sources not in the context.
 - If the answer is not in the context, say:
   "I do not see a clear answer in the provided NYDOH materials."
-- When possible, identify the relevant standard.
+- Cite the exact standard code and title when they are identifiable.
 - If the user uses a common external term such as HIPAA or PHI and that exact
   term is not present in the context, do not claim that NYDOH defines it.
-  Instead, explain which NYDOH concepts in the retrieved context are related,
-  such as confidentiality, privacy, authorized access, disclosure, security,
-  or personnel training.
+  Explain which NYDOH concepts are related.
 - Clearly distinguish an NYDOH requirement from a broader healthcare concept.
 
 QUESTION:
@@ -318,6 +546,7 @@ QUESTION:
 
 ANSWER:
 """
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -325,27 +554,102 @@ ANSWER:
         max_tokens=700,
     )
 
-    sources, seen = [], set()
+    grounded_answer = response.choices[0].message.content.strip()
+
+    sources = []
+    seen = set()
+
     for doc in docs:
         metadata = doc.metadata
         standard = metadata.get("standard") or extract_standard(doc.page_content)
+        standard = normalize_standard(str(standard))
+
         page = metadata.get("page_label")
         if page is None:
             raw_page = metadata.get("page")
             page = str(raw_page + 1) if isinstance(raw_page, int) else "Unknown"
 
+        title = extract_standard_title(doc.page_content, standard)
+        paragraph = best_supporting_paragraph(query, doc.page_content)
+
+        source_name = metadata.get("source", "Unknown")
+        pdf_url = GENERAL_URL if source_name == "NYDOH General" else HISTO_URL
+        pdf_link = f"{pdf_url}#page={page}"
+
         item = {
             "standard": standard,
-            "source": metadata.get("source", "Unknown"),
+            "title": title,
+            "source": source_name,
             "page": str(page),
+            "pdf_link": pdf_link,
             "context": re.sub(r"\s+", " ", doc.page_content).strip(),
+            "supporting_paragraph": paragraph,
+            "highlighted_paragraph": highlight_query_terms(paragraph, query),
         }
+
         key = (item["standard"], item["source"], item["page"])
         if key not in seen:
             seen.add(key)
             sources.append(item)
 
-    grounded_answer = response.choices[0].message.content.strip()
+    # Broader retrieval only for related-standard discovery.
+    related_candidates = vector_db.similarity_search(
+        expand_query_for_retrieval(query),
+        k=6,
+    )
+
+    related_standards = []
+    related_seen = {item["standard"] for item in sources}
+
+    for doc in related_candidates:
+        metadata = doc.metadata
+        standard = normalize_standard(
+            str(metadata.get("standard") or extract_standard(doc.page_content))
+        )
+
+        if standard == "NOT IDENTIFIED" or standard in related_seen:
+            continue
+
+        page = metadata.get("page_label")
+        if page is None:
+            raw_page = metadata.get("page")
+            page = str(raw_page + 1) if isinstance(raw_page, int) else "Unknown"
+
+        title = extract_standard_title(doc.page_content, standard)
+        source_name = metadata.get("source", "Unknown")
+        pdf_url = GENERAL_URL if source_name == "NYDOH General" else HISTO_URL
+
+        related_standards.append(
+            {
+                "standard": standard,
+                "title": title,
+                "source": source_name,
+                "page": str(page),
+                "pdf_link": f"{pdf_url}#page={page}",
+                "context": best_supporting_paragraph(query, doc.page_content),
+            }
+        )
+        related_seen.add(standard)
+
+        if len(related_standards) >= 4:
+            break
+
+    source_text = "\n\n".join(item["context"] for item in sources)
+
+    checklist = build_compliance_checklist(
+        query,
+        grounded_answer,
+        source_text,
+        client,
+    )
+
+    connection_sources = sources + related_standards
+    connections = explain_standard_connections(
+        query,
+        connection_sources,
+        client,
+    )
+
     concept_note = get_concept_note(query)
     web_ideas = None
 
@@ -355,8 +659,7 @@ ANSWER:
         except Exception as exc:
             web_ideas = (
                 "### Proposed implementation ideas\n\n"
-                "A web search could not be completed at this time. "
-                "The NYDOH-grounded answer above is still available.\n\n"
+                "A web search could not be completed at this time.\n\n"
                 "**Disclaimer:** These are proposed solutions found on the internet, "
                 "but they must be confirmed / verified by the Lab Director.\n\n"
                 f"_Web-search error: {exc}_"
@@ -366,6 +669,9 @@ ANSWER:
         "answer": grounded_answer,
         "concept_note": concept_note,
         "sources": sources,
+        "related_standards": related_standards,
+        "connections": connections,
+        "checklist": checklist,
         "web_ideas": web_ideas,
     }
 
@@ -377,7 +683,7 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 api_key = get_openai_api_key()
-vector_db, client, page_count, chunk_count = initialize_rag(api_key)
+vector_db, client, page_count, chunk_count, all_chunks = initialize_rag(api_key)
 
 with st.sidebar:
     st.markdown("## NYDOH Assistant")
@@ -458,7 +764,7 @@ if ask_clicked:
         st.warning("Please enter a question.")
     else:
         with st.spinner("Reviewing the NYDOH standards..."):
-            result = answer_question(cleaned, vector_db, client, retrieval_k)
+            result = answer_question(cleaned, vector_db, client, all_chunks, 2)
         st.session_state.current_question = cleaned
         st.session_state.current_result = result
         st.session_state.history.append({"question": cleaned, "result": result})
@@ -469,6 +775,7 @@ left, right = st.columns([1.7, 1])
 
 with left:
     st.markdown('<div class="eyebrow">Current answer</div>', unsafe_allow_html=True)
+
     if st.session_state.current_result is None:
         with st.container(border=True):
             st.markdown(
@@ -476,17 +783,44 @@ with left:
                 unsafe_allow_html=True,
             )
     else:
-        with st.container(border=True):
-            concept_note = st.session_state.current_result.get("concept_note")
-            if concept_note:
-                st.info(concept_note)
+        result = st.session_state.current_result
 
-            st.markdown(st.session_state.current_result["answer"])
+        answer_tab, checklist_tab, connections_tab = st.tabs(
+            ["Answer", "Compliance checklist", "Connected standards"]
+        )
 
-            web_ideas = st.session_state.current_result.get("web_ideas")
-            if web_ideas:
-                st.markdown("---")
-                st.markdown(web_ideas)
+        with answer_tab:
+            with st.container(border=True):
+                concept_note = result.get("concept_note")
+                if concept_note:
+                    st.info(concept_note)
+
+                st.markdown(result["answer"])
+
+                web_ideas = result.get("web_ideas")
+                if web_ideas:
+                    st.markdown("---")
+                    st.markdown(web_ideas)
+
+        with checklist_tab:
+            with st.container(border=True):
+                checklist = result.get("checklist")
+                if checklist:
+                    st.markdown(checklist)
+                    st.caption(
+                        "This checklist is derived only from the retrieved NYDOH text "
+                        "and should be reviewed against the full standard."
+                    )
+                else:
+                    st.info("A checklist could not be generated from the retrieved text.")
+
+        with connections_tab:
+            with st.container(border=True):
+                connections = result.get("connections")
+                if connections:
+                    st.markdown(connections)
+                else:
+                    st.info("No additional standard connections were identified.")
 
 with right:
     st.markdown('<div class="eyebrow">Supporting standards</div>', unsafe_allow_html=True)
@@ -501,15 +835,27 @@ with right:
             st.info("No supporting passages were retrieved.")
         else:
             for source in sources:
-                excerpt = source["context"][:520]
-                if len(source["context"]) > 520:
-                    excerpt += "…"
                 st.markdown(
                     f"""
                     <div class="source-card">
-                        <div class="source-title">{source['standard']} | Page {source['page']}</div>
-                        <div class="source-text">{excerpt}</div>
+                        <div class="source-title">
+                            {source['standard']} — {source['title']}
+                        </div>
+                        <div><strong>Page {source['page']}</strong> ·
+                        <a href="{source['pdf_link']}" target="_blank">Open PDF</a></div>
+                        <div class="source-text" style="margin-top:.55rem;">
+                            {source['highlighted_paragraph']}
+                        </div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
+
+            related = st.session_state.current_result.get("related_standards", [])
+            if related:
+                st.markdown("#### Related standards")
+                for item in related:
+                    st.markdown(
+                        f"- **[{item['standard']} — {item['title']}]"
+                        f"({item['pdf_link']})**, page {item['page']}"
+                    )
