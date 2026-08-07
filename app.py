@@ -114,6 +114,79 @@ def initialize_rag(api_key):
     )
     return vector_db, OpenAI(api_key=api_key), len(all_pages), len(chunks)
 
+def asks_for_compliance_ideas(query):
+    """
+    Detect whether the user is asking how to implement or comply with a standard.
+    This intentionally uses a conservative phrase-based rule so normal standards
+    questions remain document-only.
+    """
+    normalized = re.sub(r"\s+", " ", query.lower()).strip()
+
+    compliance_phrases = [
+        "how do we comply",
+        "how can we comply",
+        "how should we comply",
+        "how to comply",
+        "ways to comply",
+        "steps to comply",
+        "help us comply",
+        "implement this standard",
+        "implement the standard",
+        "how do we implement",
+        "how can we implement",
+        "how should we implement",
+        "implementation ideas",
+        "compliance ideas",
+        "best practices for",
+        "practical steps",
+        "what should the laboratory do",
+        "what can the laboratory do",
+    ]
+
+    return any(phrase in normalized for phrase in compliance_phrases)
+
+
+def get_web_compliance_ideas(query, client):
+    """
+    Search the public web for practical implementation ideas.
+
+    This is intentionally separate from the NYDOH-grounded answer so users can
+    distinguish regulatory requirements from outside suggestions.
+    """
+    web_prompt = f"""
+The user is asking for practical ideas for complying with an NYDOH clinical
+laboratory standard.
+
+USER QUESTION:
+{query}
+
+Search the public web for practical, non-vendor-specific implementation ideas.
+Prioritize authoritative sources such as government agencies, accreditation
+organizations, professional laboratory organizations, universities, and
+recognized quality-management sources.
+
+Do not present internet material as an NYDOH requirement.
+Do not provide legal advice.
+Do not include or request patient-identifiable information.
+
+Return:
+1. A short heading: "Proposed implementation ideas"
+2. Four to seven concise, practical ideas.
+3. A short "Web sources consulted" list with source names and URLs.
+4. End with this exact disclaimer:
+
+"These are proposed solutions found on the internet, but they must be confirmed / verified by the Lab Director."
+"""
+
+    response = client.responses.create(
+        model="gpt-5-mini",
+        tools=[{"type": "web_search"}],
+        input=web_prompt,
+    )
+
+    return response.output_text.strip()
+
+
 def answer_question(query, vector_db, client, k=2):
     docs = vector_db.similarity_search(query, k=k)
     if not docs:
@@ -174,7 +247,27 @@ ANSWER:
             seen.add(key)
             sources.append(item)
 
-    return {"answer": response.choices[0].message.content.strip(), "sources": sources}
+    grounded_answer = response.choices[0].message.content.strip()
+    web_ideas = None
+
+    if asks_for_compliance_ideas(query):
+        try:
+            web_ideas = get_web_compliance_ideas(query, client)
+        except Exception as exc:
+            web_ideas = (
+                "### Proposed implementation ideas\n\n"
+                "A web search could not be completed at this time. "
+                "The NYDOH-grounded answer above is still available.\n\n"
+                "**Disclaimer:** These are proposed solutions found on the internet, "
+                "but they must be confirmed / verified by the Lab Director.\n\n"
+                f"_Web-search error: {exc}_"
+            )
+
+    return {
+        "answer": grounded_answer,
+        "sources": sources,
+        "web_ideas": web_ideas,
+    }
 
 if "current_result" not in st.session_state:
     st.session_state.current_result = None
@@ -190,12 +283,9 @@ with st.sidebar:
     st.markdown("## NYDOH Assistant")
     st.caption("Clinical Laboratory Standards")
 
-    retrieval_k = st.select_slider(
-        "Retrieved passages",
-        options=[1, 2, 3, 4],
-        value=2,
-        help="More passages may improve recall but can reduce precision.",
-    )
+    retrieval_k = 2
+    st.markdown("**Retrieved passages:** 2")
+    st.caption("This setting is fixed to preserve consistent retrieval behavior.")
 
     st.markdown("---")
     st.markdown(f"**Documents loaded:** {page_count} pages")
@@ -223,7 +313,12 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown(
-        '<div class="small-note">Verify critical compliance decisions against the official documents.</div>',
+        '<div class="small-note">'
+        '<strong>NYDOH answers:</strong> based only on the indexed standards.<br><br>'
+        '<strong>Compliance ideas:</strong> a public web search is used only when the '
+        'question asks how to comply or implement a standard. Do not enter patient-identifiable information.<br><br>'
+        'Verify critical compliance decisions against the official documents.'
+        '</div>',
         unsafe_allow_html=True,
     )
 
@@ -282,6 +377,12 @@ with left:
     else:
         st.markdown('<div class="answer-card">', unsafe_allow_html=True)
         st.markdown(st.session_state.current_result["answer"])
+
+        web_ideas = st.session_state.current_result.get("web_ideas")
+        if web_ideas:
+            st.markdown("---")
+            st.markdown(web_ideas)
+
         st.markdown("</div>", unsafe_allow_html=True)
 
 with right:
